@@ -1,0 +1,20 @@
+#!/bin/bash
+# slurm-build — run buildkit-slurm-build.sh as a job step inside the
+# CI job's pre-allocated SLURM allocation.
+#
+# Default: build only (writes layer paths for slurm-run).
+# `slurm-build --push`: build + push to $CI_REGISTRY_IMAGE (single
+# cached re-solve via the warm BuildKit daemon).
+#
+# Expected usage in .gitlab-ci.yml:
+#   script:
+#     - slurm-build           # build (no push)
+#     - slurm-run              # GPU smoke test
+#     - slurm-build --push     # cached re-solve + registry push
+set -euo pipefail
+
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+
+require_alloc
+run_in_alloc buildkit-slurm-build.sh "$@"

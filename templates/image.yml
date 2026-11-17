@@ -1,0 +1,66 @@
+# Image builds for a project's own registry -- one convention, two builders.
+#
+#   include:
+#     # a GitLab copy (mirror) of this repository:
+#     - project: my-group/slurm-gpu-for-gitlab-ci
+#       ref: main
+#       file: templates/image.yml
+#     # or straight from GitHub:
+#     # - remote: https://raw.githubusercontent.com/EagleEyeElite/slurm-gpu-for-gitlab-ci/main/templates/image.yml
+#
+#   build-image:
+#     extends: .image-slurm          # or .image-buildah
+#     variables:
+#       BUILDKIT_BUILD_ARGS: "MY_COMMIT"   # names, not values
+#       MY_COMMIT: "$CI_COMMIT_SHA"
+#
+# Both push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}, and :latest from the
+# default branch only. Both read the same variables:
+#
+#   DOCKERFILE           relative to the project (default Dockerfile)
+#   BUILDKIT_BUILD_ARGS  space-separated NAMES of variables passed as build
+#                        args, each with its value from the job's environment
+#
+# and both hand the Dockerfile the CI job token as the BuildKit secret
+# `gitlab_token` (RUN --mount=type=secret,id=gitlab_token), never as a layer
+# or a build arg. A project keeps its own `stage`, `needs` and `rules` -- which
+# builder runs when is its decision, not this file's.
+#
+# .image-slurm   the SLURM runner's BuildKit (`slurm-build --push`,
+#                docs/consumer-api.md). Needs the project to have the runner
+#                enabled.
+# .image-buildah a runner with buildah in its job image (tags: buildah, e.g. a
+#                docker/kubernetes runner using quay.io/buildah/stable), for
+#                projects without the SLURM runner.
+
+.image-slurm:
+  tags: [slurm]
+  script:
+    - slurm-build --push
+    - echo "pushed ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+
+.image-buildah:
+  tags: [buildah]
+  variables:
+    BUILDAH_ISOLATION: chroot
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | buildah login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - |
+      set -eu
+      printf '%s' "$CI_JOB_TOKEN" > /tmp/gitlab_token
+      # "$@" as the list: POSIX sh has no arrays, and a value may hold spaces.
+      set --
+      for n in ${BUILDKIT_BUILD_ARGS:-}; do
+        set -- "$@" --build-arg "$n=$(printenv "$n" || true)"
+      done
+      buildah bud --secret id=gitlab_token,src=/tmp/gitlab_token \
+        "$@" --file "${DOCKERFILE:-Dockerfile}" --tag local:build .
+      rm -f /tmp/gitlab_token
+      buildah tag local:build "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      buildah push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" "docker://${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      if [ "${CI_COMMIT_BRANCH:-}" = "$CI_DEFAULT_BRANCH" ]; then
+        buildah tag local:build "${CI_REGISTRY_IMAGE}:latest"
+        buildah push "${CI_REGISTRY_IMAGE}:latest" "docker://${CI_REGISTRY_IMAGE}:latest"
+      fi
+      echo "pushed ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"

@@ -1,0 +1,159 @@
+#!/bin/bash
+# slurm-service — run a command with a service from an image beside it, and
+# stop the service when the command ends.
+#
+#   slurm-service <name> --image docker://<ref> --cmd '<command, {port} for the port>' \
+#       [--ready <path>]... [--wait <seconds>] [--gpu] [--pwd <dir>] \
+#       [--bind <host>:<container>[:ro]]... [--env KEY=VALUE]... [--env-file <file>] \
+#       -- <command> [args...]
+#
+# The service listens on a port the kernel picks ({port} is 0: it binds
+# whatever is free, and this reads back which port it got); the command gets
+# <NAME>_URL=http://127.0.0.1:<port> (the name upper-cased, - as _). Nest calls
+# for several services: an inner one starts once the outer one serves, and
+# stops before it. ${VAR} in an --env value is expanded when the service
+# starts, so an inner service can be given an outer one's URL ('${EMBED_URL}',
+# single-quoted).
+#
+#   --ready <path>   answers HTTP 200 once the service serves; repeatable, each
+#                    waited for in turn (default: /). A service that binds
+#                    before it is ready needs the path that says so.
+#   --wait <s>       give up after this long, for all of them (default 600)
+#   --gpu            the job's GPUs inside the container (singularity --nv)
+#   --env-file <f>   KEY=VALUE lines for the container, if the file exists
+#                    (e.g. ~/.config/slurm-gitlab-ci/secrets for a GITLAB_TOKEN)
+#
+# WHERE IT RUNS. In a CI job (SLURM_PIPELINE_ALLOC) all of it -- the services
+# and the command -- runs as one step of the job's own allocation, on its
+# compute node, with all of the job's CPUs, GPUs and memory (SLURM_GPUS,
+# SLURM_CPUS, SLURM_MEM). Never on the login node, and never as a second job:
+# a plain `srun --gres=...` beside the runner's allocation is one, and holds
+# that many GPUs a second time (the job's own sit idle on one node while the
+# second job's are busy on another). Outside an allocation it runs where it
+# is called.
+#
+# The image becomes a SIF through slurm-sif; a CI job pulls with its job token
+# (the image's project must allow the calling one). /tmp is private to each
+# service; RUNNER_CACHE is not passed in (it names a path that exists only
+# inside slurm-run's container).
+set -euo pipefail
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+
+usage() { sed -n '5,8p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+# Into the job's allocation first, once: everything below then runs on the node.
+if [ -n "${SLURM_PIPELINE_ALLOC:-}" ] && [ "${SLURM_JOB_ID:-}" != "$SLURM_PIPELINE_ALLOC" ]; then
+    gres=()
+    [ "${SLURM_GPUS:-0}" != 0 ] && gres=(--gres="${SLURM_GRES_NAME:-gpu}:$SLURM_GPUS")
+    exec srun --jobid="$SLURM_PIPELINE_ALLOC" --overlap --ntasks=1 \
+        --cpus-per-task="${SLURM_CPUS:-2}" "${gres[@]+"${gres[@]}"}" --mem=0 \
+        bash "$(translated_buildkit_dir)/bin/slurm-service" "$@"
+fi
+
+name="${1:-}"; shift || true
+[[ "$name" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || usage
+image="" cmd="" wait_s=600 gpu=0 pwd="" envfile=""
+ready=() binds=() envs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --image)    image="$2"; shift 2 ;;
+        --cmd)      cmd="$2"; shift 2 ;;
+        --ready)    ready+=("$2"); shift 2 ;;
+        --wait)     wait_s="$2"; shift 2 ;;
+        --gpu)      gpu=1; shift ;;
+        --pwd)      pwd="$2"; shift 2 ;;
+        --bind)     binds+=(--bind "$2"); shift 2 ;;
+        --env)      envs+=("$2"); shift 2 ;;
+        --env-file) envfile="$2"; shift 2 ;;
+        --)         shift; break ;;
+        *) usage ;;
+    esac
+done
+[ -n "$image" ] && [ -n "$cmd" ] && [ $# -gt 0 ] || usage
+[ ${#ready[@]} -gt 0 ] || ready=(/)
+var="$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')_URL"
+log() { echo "slurm-service[$name]: $*" >&2; }
+
+if [ -n "${CI_JOB_TOKEN:-}" ] && [ -z "${SINGULARITY_DOCKER_USERNAME:-}" ]; then
+    export SINGULARITY_DOCKER_USERNAME=gitlab-ci-token SINGULARITY_DOCKER_PASSWORD="$CI_JOB_TOKEN"
+fi
+sif="$(slurm-sif "$image")" || { log "could not pull $image as a SIF"; exit 2; }
+
+tmp="/tmp/${USER:-$(id -un)}/slurm-service/${SLURM_JOB_ID:-local}.$name.$$"
+mkdir -p "$tmp"; chmod 700 "$tmp"
+
+flags=(--bind "$tmp:/tmp" "${binds[@]+"${binds[@]}"}")
+[ "$gpu" = 1 ] && flags+=(--nv)
+[ -n "$pwd" ] && flags+=(--pwd "$pwd")
+[ -n "$envfile" ] && [ -f "$envfile" ] && flags+=(--env-file "$envfile")
+# SINGULARITYENV_<KEY>, not `singularity exec --env`: --env is a
+# comma-separated list, so a value with a comma is split, and a piece with
+# an "=" in it becomes a variable of its own -- "invalid var name", and the
+# whole value is gone (e.g. a list of name@version#id=sha256 pins).
+# The prefixed variable reaches the container as given.
+for kv in "${envs[@]+"${envs[@]}"}"; do
+    kv="$(python3 -c 'import os,sys; print(os.path.expandvars(sys.argv[1]))' "$kv")"
+    export "SINGULARITYENV_${kv%%=*}=${kv#*=}"
+done
+
+pid=""
+stop() {
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null
+        for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -rf "$tmp"
+}
+trap stop EXIT
+trap 'stop; exit 143' TERM INT
+
+# The port is the service's own, bound with 0: a port picked here and freed
+# for the service to take could be taken by anything else on the node first.
+# It is read back as the TCP socket the service's processes listen on --
+# singularity runs it a few processes below $pid.
+descendants() {
+    local p
+    for p in $(pgrep -P "$1"); do echo "$p"; descendants "$p"; done
+}
+listening_port() {
+    local pids addr users p
+    pids=" $1 $(descendants "$1" | tr '\n' ' ')"
+    ss -ltnpH 2>/dev/null | while read -r _ _ _ addr _ users; do
+        for p in $(grep -o 'pid=[0-9]*' <<<"$users" | cut -d= -f2); do
+            case "$pids" in *" $p "*) echo "${addr##*:}"; return;; esac
+        done
+    done
+}
+
+log "starting $image on $(hostname)"
+env -u RUNNER_CACHE singularity exec "${flags[@]}" "$sif" sh -c "${cmd//\{port\}/0}" &
+pid=$!
+
+deadline=$((SECONDS + wait_s))
+port=""
+until port="$(listening_port "$pid")" && [ -n "$port" ]; do
+    kill -0 "$pid" 2>/dev/null || { log "exited before it listened on a port"; exit 3; }
+    [ "$SECONDS" -lt "$deadline" ] || { log "did not listen on a port within ${wait_s}s"; exit 3; }
+    sleep 1
+done
+log "listens on $(hostname):$port"
+for path in "${ready[@]}"; do
+    until curl -sf -m 5 -o /dev/null "http://127.0.0.1:$port$path"; do
+        kill -0 "$pid" 2>/dev/null || { log "exited before $path answered"; exit 3; }
+        [ "$SECONDS" -lt "$deadline" ] || {
+            log "$path did not answer 200 within ${wait_s}s:"
+            curl -s -m 5 "http://127.0.0.1:$port$path" >&2 || true
+            exit 3
+        }
+        sleep 5
+    done
+    log "$path answers (after $((SECONDS - deadline + wait_s))s)"
+done
+
+export "$var=http://127.0.0.1:$port"
+log "$var=${!var}"
+rc=0
+"$@" || rc=$?
+exit "$rc"

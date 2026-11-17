@@ -1,0 +1,142 @@
+#!/bin/bash
+# slurm-sif — the SIF of an image, built on a compute node if it is not here.
+#
+#   slurm-sif docker://registry.example.org/group/proj/my-service:8d001c51
+#   # -> $HOME/.local/sif/my-service-8d001c51.sif   (stdout, nothing else)
+#
+#   slurm-sif --prune [<name>]      apply the retention below, pull nothing
+#
+# A service that is STARTED from a SIF (a long-running GPU service, a
+# benchmark rig) would otherwise carry the pull itself: an srun line, a copy
+# of pull-sif.sh, the SIF directory, the retention rule -- one copy per
+# repository. This is the one place for all of it; callers name an image and
+# get a path.
+#
+# WHERE THE PULL RUNS. Never on the login node (mksquashfs of a 4 GB image is
+# minutes of CPU): inside a SLURM job ($SLURM_JOB_ID set) it runs in place,
+# otherwise it gets its own short srun -- not the CI job's allocation, which is
+# sized for the job (2 CPUs, no memory request) rather than for squashfs.
+# That srun takes SIF_PARTITION (default: SLURM_PARTITION, else the cluster's
+# default partition), SIF_TIME and SIF_MEM.
+# The temp dirs, the self-cleaning layer cache and the cancel handling are
+# lib/pull-sif.sh's.
+#
+# NAMES. $SIF_DIR/<last path component>-<tag>.sif (my-service-<sha>.sif).
+# A tag is required: an unversioned SIF is pulled again on every push and
+# nobody can tell which build it is.
+#
+# CREDENTIALS. SINGULARITY_DOCKER_USERNAME/_PASSWORD if the caller set them;
+# otherwise, in a CI job pulling its OWN project's image ($CI_REGISTRY_IMAGE),
+# the job token; otherwise singularity's own config
+# (~/.singularity/docker-config.json). Another project's image gets the job
+# token only if the caller passes it -- whether that project allows the
+# calling one (its job-token allowlist) is the caller's knowledge, not this
+# script's.
+#
+# RETENTION, after every pull and with --prune. Per image name the
+# $SIF_KEEP (6) most recently USED files stay -- a reuse touches the file, so
+# a SIF that is still being started does not age out behind newer builds.
+# Never deleted, whatever its age: a SIF whose file name appears in any file
+# under $SIF_PROTECT_DIR (optional; e.g. the directory where your service
+# definitions live) -- deleting one of those is not a slower deploy but a GPU
+# job that cannot start. If SIF_PROTECT_DIR is set but cannot be read,
+# nothing is pruned.
+set -euo pipefail
+
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+
+SIF_DIR="${SIF_DIR:-$HOME/.local/sif}"
+SIF_KEEP="${SIF_KEEP:-6}"
+SIF_PROTECT_DIR="${SIF_PROTECT_DIR:-}"
+
+log() { echo "slurm-sif: $*" >&2; }
+
+# prune <name>: retention for $SIF_DIR/<name>-*.sif, as described above.
+prune() {
+    local name="$1" protected=" " f n=0
+    if [ -n "$SIF_PROTECT_DIR" ]; then
+        [ -d "$SIF_PROTECT_DIR" ] && [ -r "$SIF_PROTECT_DIR" ] || {
+            log "cannot read SIF_PROTECT_DIR=$SIF_PROTECT_DIR; pruning nothing"
+            return 0
+        }
+        protected=" $(grep -rhoE '[A-Za-z0-9._-]+\.sif' "$SIF_PROTECT_DIR" 2>/dev/null | sort -u | tr '\n' ' ') "
+    fi
+    # ls -t: newest mtime first; a reuse touches the file.
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        n=$((n + 1))
+        [ "$n" -gt "$SIF_KEEP" ] || continue
+        case "$protected" in
+            *" $(basename "$f") "*) log "keeping $(basename "$f") -- named under $SIF_PROTECT_DIR" ;;
+            *) log "pruning $(basename "$f") (keeping the $SIF_KEEP most recently used $name SIFs)"; rm -f "$f" ;;
+        esac
+    done < <(ls -1t "$SIF_DIR/$name"-*.sif 2>/dev/null || true)
+}
+
+if [ "${1:-}" = "--prune" ]; then
+    if [ -n "${2:-}" ]; then
+        prune "$2"
+    else
+        for f in "$SIF_DIR"/*.sif; do
+            if [ -e "$f" ]; then basename "$f" | sed -E 's/-[^-]+\.sif$//'; fi
+        done | sort -u | while read -r name; do
+            prune "$name"
+        done
+    fi
+    exit 0
+fi
+
+REF="${1:?usage: slurm-sif <docker://registry/path/name:tag> | slurm-sif --prune [<name>]}"
+REF="docker://${REF#docker://}"
+path="${REF#docker://}"
+case "${path##*/}" in
+    *@sha256:*) name="${path##*/}"; name="${name%%@*}"; tag="${path##*@sha256:}"; tag="${tag:0:12}" ;;
+    *:*)        name="${path##*/}"; tag="${name##*:}"; name="${name%%:*}" ;;
+    *)          log "$REF names no tag; a SIF has to be versioned"; exit 2 ;;
+esac
+OUT="$SIF_DIR/${name}-${tag}.sif"
+mkdir -p "$SIF_DIR"
+
+if [ -s "$OUT" ]; then
+    touch "$OUT"
+    log "$(basename "$OUT") is here"
+    echo "$OUT"
+    exit 0
+fi
+
+if [ -z "${SINGULARITY_DOCKER_USERNAME:-}" ] && [ -n "${CI_JOB_TOKEN:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then
+    case "$path" in
+        "$CI_REGISTRY_IMAGE":*|"$CI_REGISTRY_IMAGE"/*|"$CI_REGISTRY_IMAGE"@*)
+            export SINGULARITY_DOCKER_USERNAME=gitlab-ci-token SINGULARITY_DOCKER_PASSWORD="$CI_JOB_TOKEN" ;;
+    esac
+fi
+
+lib="$(translated_buildkit_dir)/lib/pull-sif.sh"
+# The existence check is repeated ON THE NODE by pull-sif.sh: checked only
+# here it races the NFS client's negative-lookup cache, and a "missing" file
+# another node just wrote became "will not overwrite" (exit 255).
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    bash "$lib" "$OUT" "$REF" >&2
+else
+    # --chdir: the caller's directory may be one the node cannot see (a
+    # /nix/store path, say).
+    mapfile -t SCHED < <(SLURM_PARTITION="${SIF_PARTITION:-${SLURM_PARTITION:-}}" slurm_sched_args)
+    srun "${SCHED[@]+"${SCHED[@]}"}" --time "${SIF_TIME:-00:30:00}" \
+        --mem "${SIF_MEM:-8G}" --job-name sif-pull --chdir "$(dirname "$OUT")" \
+        bash "$lib" "$OUT" "$REF" </dev/null >&2
+fi
+# The file was written on ANOTHER node, and this one looked for it a moment
+# ago: its NFS client may still hold that negative answer. A pull served from
+# singularity's cache takes seconds, well inside that window, and the SIF
+# that was just written can read as missing. Reading the directory
+# revalidates it; a minute is far beyond the attribute cache's lifetime.
+for _ in $(seq 1 12); do
+    [ -s "$OUT" ] && break
+    ls -a "$(dirname "$OUT")" >/dev/null 2>&1
+    sleep 5
+done
+[ -s "$OUT" ] || { log "the pull of $REF reported success but $OUT is not there"; exit 1; }
+touch "$OUT"
+prune "$name"
+echo "$OUT"

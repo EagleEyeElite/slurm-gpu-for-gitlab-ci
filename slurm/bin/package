@@ -1,0 +1,62 @@
+#!/bin/bash
+# package — files in GitLab's generic package registry, in CI and off it.
+#
+#   package put    <file> <package> <version> [<name>]   upload, as <name> (default: the file's name)
+#   package get    <package> <version> <name> [<dest>]   download; prints the path (default ./<name>)
+#   package exists <package> <version> <name>            exit 0 if it is there
+#
+#   --project <id|group/path>   whose registry (default: $PACKAGE_PROJECT, else
+#                               the CI job's own project)
+#
+# Tokens (lib/registry.sh): a put in CI uses the job token, into the job's own
+# project; off CI, GITLAB_TOKEN. A read prefers GITLAB_TOKEN (or the one in
+# ~/.config/slurm-gitlab-ci/secrets), else the job token.
+#
+# One small file per call, from wherever this runs. Something that outgrows
+# GitLab's 5 GB per file is a `slurm-cache publish`: numbered parts plus a
+# manifest, fetched back verified by `slurm-cache fetch`.
+set -euo pipefail
+# shellcheck source=../lib/registry.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/registry.sh"
+
+usage() { sed -n '4,10p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+project="${PACKAGE_PROJECT:-${CI_PROJECT_ID:-}}"
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --project) project="${2:?--project needs an id or a path}"; shift 2 ;;
+        -h|--help) usage ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+cmd="${1:-}"; shift || true
+[ -n "$project" ] || { echo "package: which project? --project <id|path>, or run in CI" >&2; exit 2; }
+
+case "$cmd" in
+    put)
+        [ $# -ge 3 ] && [ $# -le 4 ] || usage
+        file="$1"; name="${4:-$(basename "$1")}"
+        [ -f "$file" ] || { echo "package: no such file: $file" >&2; exit 1; }
+        registry_put "$file" "$(registry_url "$project" "$2" "$3" "$name")"
+        echo "package: $2/$3/$name ($(stat -c %s "$file") bytes) -> project $project" >&2
+        ;;
+    get)
+        [ $# -ge 3 ] && [ $# -le 4 ] || usage
+        dest="${4:-./$3}"
+        hdr="$(registry_read_header)"
+        mkdir -p "$(dirname "$dest")"
+        curl -sS --fail -H "$hdr" -o "$dest.part" "$(registry_url "$project" "$1" "$2" "$3")" \
+            || { rm -f "$dest.part"; echo "package: $1/$2/$3 is not in project $project's registry" >&2; exit 1; }
+        mv "$dest.part" "$dest"
+        echo "$dest"
+        ;;
+    exists)
+        [ $# -eq 3 ] || usage
+        hdr="$(registry_read_header)"
+        code=$(curl -sS -o /dev/null -w '%{http_code}' -H "$hdr" -r 0-0 "$(registry_url "$project" "$1" "$2" "$3")") || code=000
+        case "$code" in 200|206) exit 0 ;; *) exit 1 ;; esac
+        ;;
+    *) usage ;;
+esac

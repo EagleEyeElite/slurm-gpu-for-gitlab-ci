@@ -1,0 +1,18 @@
+#!/bin/bash
+# upload-to-package-registry <file-glob> <package-name> [version] -- kept for
+# pipelines that call it; new ones call `package put` (bin/package).
+#
+# One file (the first the glob matches) into the CI job's own project, as
+# `package put` does it, but on the compute node of the job's allocation: for
+# files on the shared home that are big enough for the login node's uplink to
+# matter. Version defaults to $CI_COMMIT_SHORT_SHA.
+set -euo pipefail
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+[[ $# -ge 2 ]] || { echo "usage: $(basename "$0") <file-glob> <package-name> [version]" >&2; exit 2; }
+require_alloc
+# shellcheck disable=SC2086  # intentional glob expansion
+FILE=$(ls -1 $1 2>/dev/null | head -n 1 || true)
+[[ -n "$FILE" ]] || { echo "ERROR: no file matching '$1'" >&2; exit 1; }
+VERSION="${3:-${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA not set and no explicit version given}}"
+run_in_alloc bin/package put "$FILE" "$2" "$VERSION"

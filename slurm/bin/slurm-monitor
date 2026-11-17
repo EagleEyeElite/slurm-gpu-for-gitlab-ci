@@ -1,0 +1,115 @@
+#!/bin/bash
+# slurm-monitor — what a job actually used: CPU, memory, IO and GPUs of the
+# job's own cgroup, sampled on the node it runs on, with the job's phases.
+#
+#   slurm-monitor start <dir> [--interval S] [--subtree PID]
+#   slurm-monitor stop  <dir>
+#   slurm-monitor plot  <dir> [--title T] [--out FILE]
+#   slurm-monitor compare --before <dir> --after <dir>
+#   slurm-monitor mark  "<label>" [phase-start|phase-end|point]
+#
+# start   samples into <dir>/samples.jsonl every S seconds (default 2) and
+#         returns. In a CI job it runs as an extra step of the job's allocation
+#         (srun --overlap) on the COMPUTE node, reading that job's cgroup, so a
+#         neighbour on the shared node is excluded; outside one it samples
+#         here (--subtree PID: only that process tree). <dir>/events.jsonl is
+#         created if it is not there.
+# stop    stops it and writes, next to the samples: trace.json (load it in
+#         ui.perfetto.dev), summary.txt, performance.json (the same facts for
+#         storage), and the figure when matplotlib is at hand. Never fails --
+#         a profile must not turn a good job red.
+# plot    utilisation.svg from a profile (matplotlib, else `uv run --with`).
+# compare two profiles phase by phase: the tool for an optimisation loop.
+# mark    appends one event to $RESMON_EVENTS; a no-op when it is unset.
+#
+# THE JOB'S SIDE is one file: append JSON lines {"t": <unix seconds>,
+# "label": "...", "kind": "phase-start"|"phase-end"|"point"} to the path in
+# $RESMON_EVENTS -- set it to <dir>/events.jsonl, or inside a container to
+# wherever <dir> is bound. A label with a "/" nests under the one before it.
+# Its own curves, if it has any, go in <dir>/series.jsonl: {"t": ..., "panel":
+# "<name>", "unit": "...", "values": {"<label>": <number>}} -- panel "cpu"
+# (cores) and "memory" (bytes) join the figure's own, any other name is a
+# panel of its own (monitor/resplot.py).
+set -uo pipefail
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+HERE="$(dirname "$(dirname "$(readlink -f "$0")")")/monitor"
+
+usage() { sed -n '5,9p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+plot() {
+    local dir="$1"; shift
+    if python3 -c "import matplotlib" 2>/dev/null; then
+        python3 "$HERE/resplot.py" --dir "$dir" "$@"
+    elif command -v uv >/dev/null; then
+        uv run --quiet --no-project --with matplotlib python "$HERE/resplot.py" --dir "$dir" "$@"
+    else
+        echo "slurm-monitor: no matplotlib and no uv -- trace.json is the better view anyway" >&2
+        return 1
+    fi
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+start)
+    dir="${1:?usage: slurm-monitor start <dir>}"; shift
+    interval="${RESMON_INTERVAL:-2}" extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --interval) interval="$2"; shift 2 ;;
+            --subtree)  extra+=(--subtree "$2"); shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    mkdir -p "$dir"
+    # Created, never emptied: a job started before the sampler (a local run
+    # samples the build's own process tree, so it has to exist first) may
+    # already have marked its first phase.
+    [ -e "$dir/events.jsonl" ] || : > "$dir/events.jsonl"
+    # setsid: the shell executor runs `script` and `after_script` as separate
+    # shells, and a plain background job takes SIGHUP when the first exits --
+    # the sampler would die before the work it is meant to watch.
+    # From the login node, as an extra step of the job's allocation; from
+    # inside it (slurm-service runs its command there) right where it is --
+    # the job's cgroup is this process's.
+    if [ -n "${SLURM_PIPELINE_ALLOC:-}" ] && [ "${SLURM_JOB_ID:-}" != "$SLURM_PIPELINE_ALLOC" ]; then
+        setsid srun --jobid="$SLURM_PIPELINE_ALLOC" --overlap --ntasks=1 --cpus-per-task=1 \
+            python3 "$(translated_buildkit_dir)/monitor/resmon.py" --out "$dir/samples.jsonl" \
+            --interval "$interval" "${extra[@]+"${extra[@]}"}" >"$dir/resmon.log" 2>&1 &
+    else
+        setsid python3 "$HERE/resmon.py" --out "$dir/samples.jsonl" \
+            --interval "$interval" "${extra[@]+"${extra[@]}"}" >"$dir/resmon.log" 2>&1 &
+    fi
+    echo $! > "$dir/resmon.pid"
+    echo "slurm-monitor: sampling (pid $(cat "$dir/resmon.pid")) -> $dir"
+    ;;
+stop)
+    dir="${1:?usage: slurm-monitor stop <dir>}"
+    if [ -f "$dir/resmon.pid" ]; then
+        kill -TERM "$(cat "$dir/resmon.pid")" 2>/dev/null
+        sleep 3
+        rm -f "$dir/resmon.pid"
+    fi
+    python3 "$HERE/to_perfetto.py" --dir "$dir" || echo "slurm-monitor: no trace.json"
+    python3 "$HERE/summarize.py" --dir "$dir" | tee "$dir/summary.txt" || echo "slurm-monitor: no summary"
+    python3 "$HERE/summarize.py" --dir "$dir" --json "$dir/performance.json" >/dev/null 2>&1 \
+        || echo "slurm-monitor: no performance.json"
+    plot "$dir" 2>/dev/null || true
+    exit 0
+    ;;
+plot)
+    dir="${1:?usage: slurm-monitor plot <dir>}"; shift
+    plot "$dir" "$@"
+    ;;
+compare)
+    python3 "$HERE/compare.py" "$@"
+    ;;
+mark)
+    [ -n "${RESMON_EVENTS:-}" ] || exit 0
+    printf '{"t":%s,"label":%s,"kind":"%s"}\n' \
+        "$(date +%s.%N)" \
+        "$(printf '%s' "${1:-}" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')" \
+        "${2:-point}" >> "$RESMON_EVENTS"
+    ;;
+*) usage ;;
+esac

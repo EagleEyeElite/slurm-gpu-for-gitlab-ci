@@ -1,0 +1,102 @@
+#!/bin/bash
+# bootstrap-buildkit-rootfs — one-time seed of $BUILDKIT_ROOT on
+# $BUILDKIT_NODE with the BuildKit (Alpine) image. The persistent
+# buildkitd-<node> sbatch pivot_roots into this rootfs; without it, the
+# daemon can't start.
+#
+# Idempotent — does nothing if the rootfs is already present on the node.
+#
+# Runs on the login node. `crane export` there streams the image tar over
+# stdin into `srun -w $BUILDKIT_NODE`, so the compute node itself only
+# needs plain tar + unshare and the image's own busybox afterwards — no
+# registry access and no /nix/store on the node.
+#
+# Invocation: ~/bin/bootstrap-buildkit-rootfs (a stable shim written by
+# home-manager; it enters nix-portable first where that is how nix runs).
+set -euo pipefail
+
+# Neither .bashrc nor a login profile is sourced when this script runs
+# from home-manager's activation hook (or `ssh frontend '<cmd>'`), so the
+# inherited PATH may lack both ~/.nix-profile/bin (where crane lives) and
+# /usr/bin (where srun lives).
+export PATH="$HOME/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+HERE="$(dirname "$(readlink -f "$0")")/.."
+# shellcheck source=../lib/config.sh
+source "$HERE/lib/config.sh"
+# shellcheck source=../lib/pivot.sh
+source "$HERE/lib/pivot.sh"
+
+: "${BUILDKIT_IMAGE:=docker.io/moby/buildkit:v0.18.2}"
+require_buildkit_node
+# BOOTSTRAP_NODE only needs an override when seeding a different node
+# than the one the daemon will run on; defaults to BUILDKIT_NODE.
+: "${BOOTSTRAP_NODE:=$BUILDKIT_NODE}"
+
+if ! command -v crane >/dev/null 2>&1; then
+    echo "ERROR: crane (go-containerregistry) is not on PATH." >&2
+    echo "       Run this through the ~/bin/bootstrap-buildkit-rootfs shim," >&2
+    echo "       or from a shell where the nix profile is active." >&2
+    exit 1
+fi
+
+# Write the remote half of the script to a temp file on the shared home so
+# srun on the node can read it directly. Inlining via `srun bash -c "..."`
+# fights over stdin with the piped tar stream.
+REMOTE_SCRIPT=$(mktemp --tmpdir="$HOME" bootstrap-rootfs.remote.XXXXXX.sh)
+trap 'rm -f "$REMOTE_SCRIPT"' EXIT
+
+{
+    cat <<REMOTE
+#!/bin/bash
+set -euo pipefail
+# srun inherits the caller's PATH, but slurm.conf may scrub or override it,
+# and chroot lives in /usr/sbin. Pin a known-good system PATH.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+BUILDKIT_ROOT="$BUILDKIT_ROOT"
+SUBUID_START="${SUBUID_START:-}" SUBUID_COUNT="${SUBUID_COUNT:-}"
+SUBGID_START="${SUBGID_START:-}" SUBGID_COUNT="${SUBGID_COUNT:-}"
+REMOTE
+    # The subordinate-range lookup runs ON THE NODE: /etc/subuid there is
+    # what newuidmap reads, and it need not match the login node's.
+    declare -f subid_range id_maps
+    cat <<'REMOTE'
+if [[ -x "$BUILDKIT_ROOT/usr/bin/buildkitd" ]]; then
+    echo "==> Rootfs already bootstrapped at $BUILDKIT_ROOT; draining stdin and exiting."
+    cat > /dev/null
+    exit 0
+fi
+echo "==> Extracting streamed image tar into $BUILDKIT_ROOT ..."
+mkdir -p "$BUILDKIT_ROOT"
+# tar + chroot inside a user namespace, so the image's uids (0..65535) land
+# in the caller's subordinate range -- the same mapping the daemon and the
+# builds use later.
+unshare --user sleep infinity &
+NSP=$!; sleep 0.2
+id_maps "$NSP"
+nsenter -t "$NSP" --user tar xf - -C "$BUILDKIT_ROOT"
+# busybox applet symlinks (sh, mount, etc.) aren't in the image layers;
+# install them inside the rootfs so pivot_root + /bin/sh work later.
+nsenter -t "$NSP" --user chroot "$BUILDKIT_ROOT" /bin/busybox --install -s
+kill "$NSP" 2>/dev/null || true
+wait "$NSP" 2>/dev/null || true
+echo "==> Rootfs ready: $BUILDKIT_ROOT/usr/bin/buildkitd"
+REMOTE
+} > "$REMOTE_SCRIPT"
+chmod +x "$REMOTE_SCRIPT"
+
+mapfile -t SCHED < <(slurm_sched_args)
+echo "==> Streaming $BUILDKIT_IMAGE from $(hostname) to $BOOTSTRAP_NODE ..."
+crane export "$BUILDKIT_IMAGE" - \
+    | srun -w "$BOOTSTRAP_NODE" "${SCHED[@]+"${SCHED[@]}"}" --job-name=buildkit-bootstrap bash "$REMOTE_SCRIPT"
+
+cat <<DONE
+==> Bootstrap complete.
+
+Next steps:
+  1. Fire the keepalive once to bring the daemon up:
+       ~/bin/buildkitd-keepalive
+  2. Verify:
+       squeue --me -n buildkitd-$BUILDKIT_NODE   # should show one RUNNING job
+       tail ~/.local/share/buildkitd-sbatch/buildkitd-*.out
+DONE

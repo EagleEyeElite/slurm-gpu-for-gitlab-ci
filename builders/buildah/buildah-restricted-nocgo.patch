@@ -1,0 +1,53 @@
+diff --git a/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_cgo.go b/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_cgo.go
+--- a/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_cgo.go
++++ b/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_cgo.go
+@@ -0,0 +1,6 @@
++//go:build linux && cgo && !gccgo
++
++package unshare
++
++// buildah-restricted: unshare.c's constructor runs in every child (see Cmd.Start).
++const haveUnshareConstructor = true
+diff --git a/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_nocgo.go b/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_nocgo.go
+--- a/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_nocgo.go
++++ b/vendor/github.com/containers/storage/pkg/unshare/unshare_ctor_nocgo.go
+@@ -0,0 +1,6 @@
++//go:build linux && !cgo
++
++package unshare
++
++// buildah-restricted: no cgo, so no unshare.c constructor in the child (see Cmd.Start).
++const haveUnshareConstructor = false
+diff --git a/vendor/github.com/containers/storage/pkg/unshare/unshare_linux.go b/vendor/github.com/containers/storage/pkg/unshare/unshare_linux.go
+--- a/vendor/github.com/containers/storage/pkg/unshare/unshare_linux.go
++++ b/vendor/github.com/containers/storage/pkg/unshare/unshare_linux.go
+@@ -115,6 +115,29 @@
+ 		c.Env = append(c.Env, fmt.Sprintf("_CONTAINERS_ROOTLESS_GID=%d", getRootlessGID()))
+ 	}
+ 
++	// buildah-restricted: built without cgo there is no C constructor (unshare.c) in
++	// the child to write its PID, wait on the continue pipe, or do setsid /
++	// setpgrp / the controlling terminal. The parent knows the PID itself (no
++	// extra fork), Go's SysProcAttr does the rest, and the continue pipe only
++	// matters for user-namespace mappings, which the restricted build never
++	// creates (_CONTAINERS_USERNS_CONFIGURED).
++	if !haveUnshareConstructor {
++		if c.UnshareFlags&syscall.CLONE_NEWUSER != 0 {
++			return errors.New("buildah-restricted: a user namespace needs the cgo build")
++		}
++		if c.SysProcAttr == nil {
++			c.SysProcAttr = &syscall.SysProcAttr{}
++		}
++		c.SysProcAttr.Setsid = c.Setsid
++		c.SysProcAttr.Setpgid = c.Setpgrp
++		if c.Ctty != nil {
++			c.SysProcAttr.Setctty = true
++			c.SysProcAttr.Ctty = len(c.ExtraFiles) + 3
++			c.ExtraFiles = append(c.ExtraFiles, c.Ctty)
++		}
++		return c.Cmd.Start()
++	}
++
+ 	// Create the pipe for reading the child's PID.
+ 	pidRead, pidWrite, err := os.Pipe()
+ 	if err != nil {

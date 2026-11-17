@@ -1,0 +1,146 @@
+#!/bin/bash
+# slurm-allocate — reserve one SLURM allocation for the current CI job
+# and emit eval'able bash so the calling shell gains:
+#   - export SLURM_PIPELINE_ALLOC=<jobid>
+#   - trap 'scancel <jobid>' EXIT
+#
+# Invoked by gitlab-runner's pre_build_script via `eval "$(slurm-allocate)"`
+# (see ~/.gitlab-runner/config.toml, patched by home-manager). All
+# subsequent `script:` lines run in the same bash process, so both the
+# env var and the trap persist; every slurm-{build,run,push} command
+# attaches to the allocation with `srun --jobid=$SLURM_PIPELINE_ALLOC
+# --overlap`. The trap fires on the shell's natural exit (success,
+# failure, SIGTERM from a CI cancel), releasing resources; the
+# salloc --time=... safety net covers SIGKILL / runner daemon crash.
+#
+# Resource asks come from the CI job's `variables:` block:
+#   SLURM_GPUS  — default 0 (no GPU). Jobs that need it set "1" / "2" / ...
+#                 or "max": every GPU free on the job's node at this moment
+#                 (its Gres= minus its GresUsed=, from scontrol -d), at least
+#                 1 -- with none free the job asks for one and queues for it,
+#                 rather than for a whole node that serving jobs may never
+#                 hand back. The count asked for is exported as SLURM_GPUS,
+#                 so the job script reads a number (srun reads SLURM_GPUS as
+#                 --gpus, so "max" must not reach a step either).
+#   SLURM_CPUS  — default 2.
+#   SLURM_TIME  — default 120 (minutes). Raise for long-running jobs.
+#   SLURM_MEM   — unset: the partition default. e.g. 300G for a job that needs it.
+#   SLURM_NODE  — the node the job runs on. Default: $BUILDKIT_NODE, because
+#                 slurm-build/slurm-run need the node that holds the BuildKit
+#                 state. "any" lets SLURM choose (jobs that only use srun,
+#                 slurm-sif or slurm-service). Without a BUILDKIT_NODE the
+#                 default is "any".
+#
+# Site settings, from the runner's environment or lib/config.sh:
+#   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS  passed on when set
+#   SLURM_GRES_NAME   the GRES that counts GPUs (default "gpu")
+#   SLURM_EXTRA_ARGS  further salloc arguments, word-split
+set -euo pipefail
+
+# shellcheck source=../lib/config.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/config.sh"
+
+# A RUNNER_CACHE that does not exist is worse than none.
+#
+# The variable names a cache directory, and every consumer treats it as one to
+# mkdir under. On this runner it is only real inside a container
+# run-buildkit-overlay.sh launched — it is exported there, beside the bind that
+# creates it — so on the login node and on a bare compute node it should be
+# absent, and libraries should fall back to ~/.cache on the shared home.
+#
+# This is the belt to that braces. A config.toml written by an older
+# home-manager generation still carries RUNNER_CACHE=/runner-cache in its
+# `environment` block, and will until the runner is switched; a job that
+# inherits it fails minutes later and several layers down with
+# FileNotFoundError on a path it was handed and had no reason to doubt.
+#
+# So: if it is set and is not a writable directory, drop it and say so. A
+# missing variable is a fallback; a wrong one is a bug report from a library
+# that did nothing wrong.
+if [[ -n "${RUNNER_CACHE:-}" ]] && [[ ! -w "${RUNNER_CACHE}" || ! -d "${RUNNER_CACHE}" ]]; then
+    echo ">> slurm-allocate: RUNNER_CACHE='${RUNNER_CACHE}' is not a writable" \
+         "directory here; unsetting it (consumers fall back to ~/.cache)" >&2
+    echo "unset RUNNER_CACHE"
+fi
+
+: "${SLURM_GPUS:=0}"
+: "${SLURM_CPUS:=2}"
+: "${SLURM_TIME:=120}"
+: "${SLURM_GRES_NAME:=gpu}"
+# The node: the job's SLURM_NODE, else the BuildKit node (the one set up
+# with subuids, user namespaces and the BuildKit state; see
+# docs/admin-requirements.md), else wherever SLURM puts it.
+NODE="${SLURM_NODE:-${BUILDKIT_NODE:-any}}"
+[[ "$NODE" == any ]] && NODE=""
+
+# "max" resolves to a number here, once, from the node's own accounting: Gres=
+# is what it has, GresUsed= (only with -d) what running jobs hold, both as
+# comma-separated gpu[:type]:N entries with an optional "(S:0)" / "(IDX:0-1)"
+# that is dropped before splitting -- an IDX list carries commas of its own.
+# A job that takes GPUs between this read and the salloc makes the salloc
+# queue until they are back; a snapshot is all "free right now" can mean.
+GPUS_RESOLVED=""
+if [[ "$SLURM_GPUS" == max ]]; then
+    if [[ -z "$NODE" ]]; then
+        echo "slurm-allocate: SLURM_GPUS=max counts the free GPUs of one node; set SLURM_NODE (or BUILDKIT_NODE)" >&2
+        exit 1
+    fi
+    gpu_sum() { sed 's/([^)]*)//g' | tr ',' '\n' | awk -F: -v g="$SLURM_GRES_NAME" '$1 == g { n += $NF } END { print n + 0 }'; }
+    NODE_LINE=$(scontrol -d show node "$NODE" -o) || {
+        echo "slurm-allocate: SLURM_GPUS=max but 'scontrol show node $NODE' failed" >&2
+        exit 1
+    }
+    GPUS_TOTAL=$(tr ' ' '\n' <<<"$NODE_LINE" | sed -n 's/^Gres=//p' | gpu_sum)
+    GPUS_USED=$(tr ' ' '\n' <<<"$NODE_LINE" | sed -n 's/^GresUsed=//p' | gpu_sum)
+    if (( GPUS_TOTAL == 0 )); then
+        echo "slurm-allocate: SLURM_GPUS=max but $NODE has no GPUs" >&2
+        exit 1
+    fi
+    SLURM_GPUS=$(( GPUS_TOTAL - GPUS_USED ))
+    if (( SLURM_GPUS < 1 )); then
+        echo ">> slurm-allocate: SLURM_GPUS=max but all $GPUS_TOTAL GPUs of" \
+             "$NODE are taken; asking for 1 and queueing for it" >&2
+        SLURM_GPUS=1
+    fi
+    GPUS_RESOLVED=" of $GPUS_TOTAL, max"
+fi
+
+# salloc has no --parsable flag (unlike sbatch), so we grep the jobid
+# out of its human-readable "Granted job allocation N" line on stderr.
+# --no-shell lets salloc hold the allocation without spawning a child
+# shell; the allocation persists until explicit scancel or --time expiry.
+#
+if ! [[ "$SLURM_GPUS" =~ ^[0-9]+$ ]]; then
+    echo "slurm-allocate: SLURM_GPUS='$SLURM_GPUS' is neither a number nor \"max\"" >&2
+    exit 1
+fi
+# --gres only when GPUs are asked for: a cluster without a GPU GRES rejects
+# even gpu:0.
+ARGS=(--no-shell)
+[[ -n "$NODE" ]] && ARGS+=(-w "$NODE")
+mapfile -t SCHED < <(slurm_sched_args)
+ARGS+=("${SCHED[@]+"${SCHED[@]}"}")
+(( SLURM_GPUS > 0 )) && ARGS+=(--gres="$SLURM_GRES_NAME:$SLURM_GPUS")
+ARGS+=(-c "$SLURM_CPUS")
+[[ -n "${SLURM_MEM:-}" ]] && ARGS+=(--mem="$SLURM_MEM")
+ARGS+=(--time="$SLURM_TIME" --job-name="cijob-${CI_JOB_ID:-manual}")
+# shellcheck disable=SC2206  # word-splitting is the point
+[[ -n "${SLURM_EXTRA_ARGS:-}" ]] && ARGS+=($SLURM_EXTRA_ARGS)
+SALLOC_OUT=$(salloc "${ARGS[@]}" 2>&1) || true
+ALLOC_ID=$(echo "$SALLOC_OUT" | grep -oE 'Granted job allocation [0-9]+' | awk '{print $NF}' | tail -1) || true
+
+if [[ -z "$ALLOC_ID" || ! "$ALLOC_ID" =~ ^[0-9]+$ ]]; then
+    echo "slurm-allocate: salloc failed" >&2
+    echo "$SALLOC_OUT" >&2
+    exit 1
+fi
+
+# Emit the code the runner shell will eval. The trap is single-quoted so
+# $ALLOC_ID is captured at definition time (it won't be visible inside
+# the trap body if we used a late-bound var reference).
+cat <<EOF
+export SLURM_PIPELINE_ALLOC=$ALLOC_ID
+${GPUS_RESOLVED:+export SLURM_GPUS=$SLURM_GPUS
+}trap 'scancel $ALLOC_ID 2>/dev/null || true' EXIT
+echo ">> slurm-allocate: pipeline allocation \$SLURM_PIPELINE_ALLOC held (gpu=$SLURM_GPUS$GPUS_RESOLVED cpus=$SLURM_CPUS${SLURM_MEM:+ mem=$SLURM_MEM} time=${SLURM_TIME}min)"
+EOF

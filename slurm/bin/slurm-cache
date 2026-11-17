@@ -1,0 +1,304 @@
+#!/bin/bash
+# slurm-cache — large artifacts (tarballs) handed between CI jobs on this
+# cluster, published to GitLab's generic package registry, and fetched back
+# from it verified -- one tool, one layout, one retention rule.
+#
+#   slurm-cache put     <name> <version> <file.tar.gz> [--keep-tarball]
+#   slurm-cache path    <name> <version>                   unpacked dir, if cached
+#   slurm-cache tarball <name> <version>                   the kept tarball, if any
+#   slurm-cache drop-tarball <name> <version>
+#   slurm-cache publish <name> <version> <file.tar.gz> [extra-file...] [--project <id>]
+#   slurm-cache fetch   <name> <version> --project <id>    registry-verified copy
+#   slurm-cache --prune [<name>]
+#
+# Every command that yields a directory or file prints its path as the only
+# line on stdout; progress goes to stderr.
+#
+# WHY. A job's output that the next job needs would otherwise travel as a
+# GitLab job artifact: many GB uploaded to GitLab and downloaded again, only
+# for a job on the same cluster to read it. Here the producer unpacks it once
+# into the shared home and the consumer opens it in place:
+#
+#   build:    slurm-cache put search-index "$V" out/search-index.tar.gz --keep-tarball
+#   publish:  slurm-cache publish search-index "$V" "$(slurm-cache tarball search-index "$V")"
+#             slurm-cache drop-tarball search-index "$V"
+#   consume:  DIR="$(slurm-cache fetch search-index "$V" --project my-group/index-builder)"
+#
+# LAYOUT ($SLURM_CACHE_DIR, default ~/.cache/slurm-cache -- the NFS home, so
+# every node sees the same copy):
+#
+#   <name>/<version>/...                 the tarball's contents
+#   <name>/<version>/.ready              version, sha256 of the tarball, source
+#   <name>/.tarballs/<version>/<file>    only with --keep-tarball, until dropped
+#                                        (the file keeps its name: it is what
+#                                        `publish` names the parts after)
+#
+# .ready is written last, after the extraction succeeded; a directory without
+# it is a half-written one and never handed out. The extraction lands in
+# <version>.partial and is renamed into place, so a reader never sees it grow.
+#
+# WHAT `fetch` PROMISES. The copy it returns has the sha256 the package
+# registry records for that version RIGHT NOW (its manifest.json): a version
+# rebuilt and republished under the same name, or staged by a build whose
+# publish never happened, is a miss and is downloaded, verified and unpacked
+# again. So a cached copy is never silently a different artifact than the one
+# anybody else would get. The manifest costs a few hundred bytes per call.
+#
+# THE REGISTRY FORMAT (`publish`, read by `fetch`, and by anything else that
+# reads these packages, e.g. a Helm init container): GitLab caps a package file
+# at 5 GB, so the tarball goes up as byte-range parts of 4 GiB plus
+#
+#   manifest.json  {"file", "total_bytes", "sha256", "parts": [{"name","bytes"}]}
+#
+# Parts first, extra files next, manifest LAST: a manifest means the version is
+# complete. A manifest is written even for one part, so readers have one path.
+#
+# RETENTION, per name, on every put/fetch and with --prune: the
+# $SLURM_CACHE_KEEP (4) most recently used versions stay (a hit touches .ready),
+# and the $SLURM_CACHE_TARBALLS_KEEP (2) newest kept tarballs. Directories
+# without .ready that are older than a day are an interrupted extraction and go.
+#
+# TOKENS (lib/registry.sh, shared with `package`). fetch: GITLAB_TOKEN, else
+# the one in ~/.config/slurm-gitlab-ci/secrets, else the CI job token. publish: in CI
+# the job token, into the job's own project; off CI GITLAB_TOKEN and
+# --project (or $SLURM_CACHE_PROJECT).
+set -euo pipefail
+# shellcheck source=../lib/registry.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/registry.sh"
+# shellcheck source=../lib/dispatch.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+
+ROOT="${SLURM_CACHE_DIR:-$HOME/.cache/slurm-cache}"
+KEEP="${SLURM_CACHE_KEEP:-4}"
+TARBALLS_KEEP="${SLURM_CACHE_TARBALLS_KEEP:-2}"
+PART_BYTES="${SLURM_CACHE_PART_BYTES:-$((4 * 1024 * 1024 * 1024))}"   # smaller only for tests
+
+log() { echo "slurm-cache: $*" >&2; }
+die() { log "$*"; exit 1; }
+usage() { sed -n '6,13p' "$(readlink -f "$0")" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+valid() { [[ "$1" =~ ^[A-Za-z0-9._+-]+$ ]] || die "'$1' is not a valid name or version"; }
+
+ready_sha() { sed -n 's/^sha256=//p' "$1/.ready" 2>/dev/null; }
+
+prune() {
+    local name="$1" dir="$ROOT/$1" d n=0
+    [ -d "$dir" ] || return 0
+    # Interrupted work, a day old: an extraction (.partial), a download
+    # (.fetch-*), or a version dir that never got its marker.
+    find "$dir" -mindepth 1 -maxdepth 1 -type d \( -name '*.partial' -o -name '.fetch-*' \) \
+        -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+    for d in "$dir"/*/; do
+        d="${d%/}"
+        if [ -d "$d" ] && [ ! -f "$d/.ready" ] && [ -n "$(find "$d" -maxdepth 0 -mmin +1440)" ]; then
+            rm -rf "$d"
+        fi
+    done
+    # Most recently used first: .ready's mtime, touched on every hit.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        n=$((n + 1))
+        [ "$n" -gt "$KEEP" ] || continue
+        log "pruning $name/$(basename "$(dirname "$d")") (keeping the $KEEP most recently used)"
+        rm -rf "$(dirname "$d")"
+    done < <(ls -1t "$dir"/*/.ready 2>/dev/null || true)
+    n=0
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        n=$((n + 1))
+        [ "$n" -gt "$TARBALLS_KEEP" ] || continue
+        log "pruning tarball $name/$(basename "$d") (keeping the newest $TARBALLS_KEEP)"
+        rm -rf "$d"
+    done < <(ls -1dt "$dir"/.tarballs/*/ 2>/dev/null || true)
+}
+
+# unpack <name> <version> <tarball> <sha256> <source>: into place, marked.
+unpack() {
+    local name="$1" version="$2" tarball="$3" sha="$4" source="$5"
+    local dest="$ROOT/$name/$version" partial="$ROOT/$name/$version.partial"
+    mkdir -p "$ROOT/$name"
+    rm -rf "$partial"; mkdir -p "$partial"
+    log "unpacking $name/$version"
+    tar -xzf "$tarball" -C "$partial" || { rm -rf "$partial"; die "could not unpack $tarball"; }
+    settle "$name" "$version" "$sha" "$source"
+}
+
+# settle <name> <version> <sha256> <source>: <version>.partial into place,
+# then the marker -- so the only directory that ever carries one is complete.
+settle() {
+    local dest="$ROOT/$1/$2"
+    rm -rf "$dest"
+    mv "$ROOT/$1/$2.partial" "$dest"
+    printf 'version=%s\nsha256=%s\nsource=%s\ncached=%s\n' \
+        "$2" "$3" "$4" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$dest/.ready"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+put)
+    name="${1:?}"; version="${2:?}"; tarball="${3:?}"; shift 3 || usage
+    valid "$name"; valid "$version"
+    [ -s "$tarball" ] || die "no tarball at $tarball"
+    keep_tarball=0
+    [ "${1:-}" = "--keep-tarball" ] && keep_tarball=1
+    sha="$(sha256sum "$tarball" | cut -d' ' -f1)"
+    unpack "$name" "$version" "$tarball" "$sha" "put${CI_JOB_ID:+ by CI job $CI_JOB_ID}"
+    if [ "$keep_tarball" = 1 ]; then
+        kept="$ROOT/$name/.tarballs/$version"
+        rm -rf "$kept"; mkdir -p "$kept"
+        cp -f "$tarball" "$kept/$(basename "$tarball").partial"
+        mv -f "$kept/$(basename "$tarball").partial" "$kept/$(basename "$tarball")"
+    fi
+    log "cached $name/$version (sha256 ${sha:0:12}…)"
+    prune "$name"
+    echo "$ROOT/$name/$version"
+    ;;
+path)
+    name="${1:?}"; version="${2:?}"; valid "$name"; valid "$version"
+    [ -f "$ROOT/$name/$version/.ready" ] || exit 1
+    touch "$ROOT/$name/$version/.ready"
+    echo "$ROOT/$name/$version"
+    ;;
+tarball)
+    name="${1:?}"; version="${2:?}"; valid "$name"; valid "$version"
+    f=""
+    for c in "$ROOT/$name/.tarballs/$version"/*; do
+        if [ -e "$c" ] && [[ "$c" != *.partial ]]; then f="$c"; break; fi
+    done
+    [ -n "$f" ] && [ -s "$f" ] || die "no kept tarball for $name/$version (was it put with --keep-tarball, and not dropped since?)"
+    echo "$f"
+    ;;
+drop-tarball)
+    name="${1:?}"; version="${2:?}"; valid "$name"; valid "$version"
+    rm -rf "$ROOT/$name/.tarballs/$version"
+    log "dropped the tarball of $name/$version"
+    ;;
+fetch)
+    name="${1:?}"; version="${2:?}"; shift 2
+    project="${SLURM_CACHE_PROJECT:-}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project) project="$2"; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    valid "$name"; valid "$version"
+    [ -n "$project" ] || die "fetch needs --project <id> (the project whose package registry holds $name)"
+    hdr="$(registry_read_header)"
+    mkdir -p "$ROOT/$name"
+    work="$(mktemp -d "$ROOT/$name/.fetch-$version.XXXXXX")"
+    trap 'rm -rf "$work" "$ROOT/$name/$version.partial"' EXIT
+    curl -sS --fail -H "$hdr" -o "$work/manifest.json" "$(registry_url "$project" "$name" "$version" manifest.json)" \
+        || die "no manifest.json for $name/$version in project $project's package registry (wrong version, or never published)"
+    want="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['sha256'])" "$work/manifest.json")"
+    dest="$ROOT/$name/$version"
+    if [ -f "$dest/.ready" ] && [ "$(ready_sha "$dest")" = "$want" ]; then
+        touch "$dest/.ready"
+        log "$name/$version is cached and matches the registry (sha256 ${want:0:12}…)"
+        prune "$name"
+        echo "$dest"
+        exit 0
+    fi
+    [ -e "$dest" ] && log "the cached $name/$version is not the published one; fetching it again"
+    total="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['total_bytes'])" "$work/manifest.json")"
+    log "fetching $name/$version ($((total / 1024 / 1024)) MiB)"
+    # STREAMED: the parts go through one pipe into tar, and a tee into a FIFO
+    # hashes the same bytes on the way past -- the tarball is never written
+    # (8.3 GB for an index, on the shared home). Nothing is trusted before the
+    # hash is: the extraction lands in <version>.partial, and a sha256 that
+    # disagrees removes it. A truncated part is the likely failure, and silent:
+    # half a tarball still extracts far enough to look like an index.
+    partial="$ROOT/$name/$version.partial"
+    rm -rf "$partial"; mkdir -p "$partial"
+    mkfifo "$work/stream"
+    sha256sum < "$work/stream" | cut -d' ' -f1 > "$work/sha256" &
+    hasher=$!
+    for part in $(python3 -c "import json,sys; print(' '.join(p['name'] for p in json.load(open(sys.argv[1]))['parts']))" "$work/manifest.json"); do
+        log "  $part"
+        curl -sS --fail -H "$hdr" "$(registry_url "$project" "$name" "$version" "$part")" || exit 1
+    done | tee "$work/stream" | tar -xzf - -C "$partial" || die "fetching or unpacking $name/$version failed"
+    wait "$hasher"
+    got="$(cat "$work/sha256")"
+    [ "$got" = "$want" ] || die "the parts hash to $got, the manifest says $want"
+    settle "$name" "$version" "$want" "registry project $project"
+    rm -rf "$work"
+    prune "$name"
+    echo "$dest"
+    ;;
+publish)
+    name="${1:?}"; version="${2:?}"; tarball="${3:?}"; shift 3
+    valid "$name"; valid "$version"
+    [ -s "$tarball" ] || die "no tarball at $tarball"
+    project="${SLURM_CACHE_PROJECT:-${CI_PROJECT_ID:-}}"
+    extras=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project) project="$2"; shift 2 ;;
+            *) extras+=("$1"); shift ;;
+        esac
+    done
+    [ -n "$project" ] || die "publish needs --project <id> outside CI"
+    # In a CI job's allocation the upload runs on the compute node: the parts
+    # are on the shared home, and the node's uplink pushes gigabytes without
+    # competing with the runner daemon on the login node.
+    upload() {
+        if [ -n "${SLURM_PIPELINE_ALLOC:-}" ]; then
+            srun --jobid="$SLURM_PIPELINE_ALLOC" --overlap \
+                bash "$(translated_buildkit_dir)/bin/package" --project "$project" put "$1" "$name" "$version" >&2
+        else
+            registry_put "$1" "$(registry_url "$project" "$name" "$version" "$(basename "$1")")"
+        fi
+    }
+    # search-index.tar.gz -> search-index-part-01.tar.gz, ...
+    file="$(basename "$tarball")"
+    case "$file" in
+        *.tar.gz) stem="${file%.tar.gz}"; ext=tar.gz ;;
+        *.*)      stem="${file%.*}"; ext="${file##*.}" ;;
+        *)        stem="$file"; ext=part ;;
+    esac
+    work="$(mktemp -d "$(dirname "$tarball")/.publish-$version.XXXXXX")"
+    trap 'rm -rf "$work"' EXIT
+    total="$(stat -c %s "$tarball")"
+    log "hashing $file ($((total / 1024 / 1024)) MiB)"
+    sha="$(sha256sum "$tarball" | cut -d' ' -f1)"
+    split -b "$PART_BYTES" -d -a 2 --numeric-suffixes=1 "$tarball" "$work/${stem}-part-"
+    for f in "$work/${stem}-part-"*; do mv "$f" "$f.$ext"; done
+    python3 - "$work" "$file" "$total" "$sha" "$stem" "$ext" > "$work/manifest.json" <<'PY'
+import json, os, sys
+work, file, total, sha, stem, ext = sys.argv[1:]
+parts = sorted(p for p in os.listdir(work) if p.startswith(stem + "-part-") and p.endswith("." + ext))
+print(json.dumps({"file": file, "total_bytes": int(total), "sha256": sha,
+                  "parts": [{"name": p, "bytes": os.path.getsize(os.path.join(work, p))} for p in parts]}, indent=2))
+PY
+    cat "$work/manifest.json" >&2
+    for p in "$work/${stem}-part-"*".$ext"; do
+        log "uploading $(basename "$p")"
+        upload "$p"
+    done
+    # Extra files (a run record, a figure, metadata) belong to the version but
+    # are not it: a missing or failed one is reported, never fatal.
+    #
+    # Copied into $work first, which is next to the tarball on the shared
+    # home: in CI the upload runs on the compute node, which cannot see the
+    # login node's /tmp -- an index's index-metadata.json, extracted to a
+    # mktemp dir there, was never published (2026.10.08-c2b53d45).
+    for extra in "${extras[@]+"${extras[@]}"}"; do
+        if [ -s "$extra" ]; then
+            log "uploading $(basename "$extra")"
+            cp -f "$extra" "$work/$(basename "$extra")"
+            ( upload "$work/$(basename "$extra")" ) || log "WARNING: $(basename "$extra") did not upload; the package is still complete"
+        else
+            log "WARNING: no $extra -- publishing without it"
+        fi
+    done
+    log "uploading manifest.json"
+    upload "$work/manifest.json"
+    log "published $name/$version ($(ls "$work/${stem}-part-"*".$ext" | wc -l) part(s), sha256 ${sha:0:12}…)"
+    ;;
+--prune)
+    if [ -n "${1:-}" ]; then prune "$1"
+    else for d in "$ROOT"/*/; do [ -d "$d" ] && prune "$(basename "$d")"; done; fi
+    ;;
+*)
+    usage ;;
+esac

@@ -1,0 +1,14 @@
+#!/bin/bash
+# slurm-run — mount the overlay layers produced by the preceding
+# slurm-build and execute the image's CMD under singularity --nv.
+# Runs as a job step inside the CI job's pre-allocated SLURM allocation.
+#
+# BIND_MOUNTS (space-separated "host:container" pairs) is forwarded
+# through run-buildkit-overlay.sh to singularity --bind.
+set -euo pipefail
+
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+
+require_alloc
+run_in_alloc run-buildkit-overlay.sh "$@"

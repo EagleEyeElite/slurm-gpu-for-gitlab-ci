@@ -1,0 +1,41 @@
+# This repository's own pipeline, for when it is mirrored to (or developed
+# on) a GitLab with the SLURM runner. On GitHub the same self-checks run from
+# .github/workflows/ci.yml.
+#
+# test-tools needs any docker runner; the other two need the SLURM runner
+# (tags: [slurm]) this repository sets up.
+
+# The scripts parse, slurm-allocate's resource asks hold against a fake
+# scontrol/salloc (slurm/tests), and the monitor's record keeps its shape
+# (slurm/monitor/tests).
+test-tools:
+  image: docker.io/python:3.12-slim
+  script:
+    - for f in slurm/bin/* slurm/lib/*.sh slurm/*.sh builders/*/*.sh bootstrap/*.sh; do bash -n "$f" || exit 1; done
+    - pip install --quiet pytest matplotlib pyyaml
+    - python -m pytest -q slurm/tests slurm/monitor/tests
+
+include:
+  - local: templates/image.yml
+
+# The slurm-cache image (images/slurm-cache): slurm-cache + package for a
+# Kubernetes init container. ${CI_REGISTRY_IMAGE}/slurm-cache:<short sha>,
+# :latest from the default branch.
+slurm-cache-image:
+  extends: .image-slurm
+  variables:
+    DOCKERFILE: images/slurm-cache/Dockerfile
+    CI_REGISTRY_IMAGE: "$CI_REGISTRY_IMAGE/slurm-cache"
+
+# End-to-end self-test: build the CUDA smoke image (examples/cuda-smoke) with
+# the same commands a consumer project uses, and run it on a GPU. Pushes only
+# from the default branch.
+cuda-smoke:
+  tags: [slurm]
+  variables:
+    SLURM_GPUS: "1"
+    DOCKERFILE: examples/cuda-smoke/Dockerfile
+  script:
+    - slurm-build
+    - slurm-run
+    - if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then slurm-build --push; fi

@@ -1,0 +1,69 @@
+#!/bin/bash
+# ensure-buildkitd-sbatch — idempotent keepalive for the persistent
+# BuildKit daemon on $BUILDKIT_NODE. Invoked every few minutes by cron on
+# the login node (~/bin/buildkitd-keepalive). If a buildkitd-<node> sbatch
+# is already queued or running, does nothing; otherwise submits one.
+#
+# No time-limit handoff (v1). The daemon's 24h sbatch expires → SLURM
+# SIGTERMs buildkitd → clean shutdown → sbatch ends → next timer tick
+# (≤5min later) submits a fresh one. Brief gap in that window; CI jobs
+# that land in the gap fail with "failed to connect" and get retried.
+set -euo pipefail
+
+# Home-manager activation runs this script with a stripped PATH (only
+# the home-manager-bundled coreutils/grep/sed etc.) — no /usr/bin, so
+# squeue/sbatch are missing and the script fails silently. Same gap
+# affects `ssh frontend '<cmd>'` non-interactive invocations. Pin a
+# known-good system PATH so the SLURM CLI is always findable.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# shellcheck disable=SC1091
+source "$(dirname "$(readlink -f "$0")")/../lib/dispatch.sh"
+
+# /nix/store-aware: under nix-portable the node can't see /nix/store, so the
+# path handed to sbatch must be the shared-home $HOME/.nix-portable rewrite.
+BUILDKIT_DIR="$(translated_buildkit_dir)"
+
+# BUILDKIT_NODE pins the compute node the daemon runs on. Cron-invoked, so
+# the runner's `environment` block isn't in scope here: lib/config.sh (via
+# dispatch.sh) reads it from ~/.config/slurm-gitlab-ci/config.
+require_buildkit_node
+: "${BUILDKIT_DAEMON_CPUS:=2}"
+: "${BUILDKIT_DAEMON_MEM:=4G}"
+: "${BUILDKIT_DAEMON_TIME:=24:00:00}"
+mapfile -t SCHED < <(slurm_sched_args)
+JOB_NAME="buildkitd-$BUILDKIT_NODE"
+LOG_DIR="$HOME/.local/share/buildkitd-sbatch"
+mkdir -p "$LOG_DIR"
+
+# squeue --me -h -n suppresses the header and filters by job name.
+# -t pending,running filters out CANCELLED/COMPLETING/FAILED zombies that
+# still appear in squeue for a few seconds after scancel — without that,
+# a wipe-and-redeploy can race the cancellation and the first activation
+# tick mistakes a draining job for an alive daemon, exiting silently.
+existing=$(squeue --me -h -n "$JOB_NAME" -t pending,running -o "%i %T" 2>/dev/null | head -1 || true)
+if [[ -n "$existing" ]]; then
+    exit 0
+fi
+
+# Not running — submit a fresh sbatch.
+#
+# -c 2 --mem=4G is a modest baseline; buildkitd at idle is small, and
+# during active builds the actual build processes (pip/uv/mvn) run
+# inside the rootfs in the same cgroup. BUILDKIT_DAEMON_CPUS/_MEM raise it.
+#
+# --time=24:00:00 is the renewal cycle — one daemon per day
+# (BUILDKIT_DAEMON_TIME; the partition's MaxTime may force less).
+# --requeue so SLURM brings it back automatically on preemption.
+# --output=… captures the daemon log for postmortem.
+sbatch_id=$(sbatch --parsable \
+    --job-name="$JOB_NAME" \
+    -w "$BUILDKIT_NODE" \
+    "${SCHED[@]+"${SCHED[@]}"}" \
+    -c "$BUILDKIT_DAEMON_CPUS" --mem="$BUILDKIT_DAEMON_MEM" \
+    --time="$BUILDKIT_DAEMON_TIME" \
+    --requeue \
+    --output="$LOG_DIR/buildkitd-%j.out" \
+    --wrap="bash '$BUILDKIT_DIR/buildkitd-sbatch.sh'" 2>&1)
+
+echo "ensure-buildkitd-sbatch: submitted job $sbatch_id"

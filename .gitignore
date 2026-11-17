@@ -1,0 +1,19 @@
+# Compiled helpers (regenerated on first run)
+builders/buildah/fakemount-simple
+builders/buildah/buildah-wrap
+slurm/fakemount
+
+# nix
+result
+result-*
+
+# Build artifacts
+*.tar
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+.pytest_cache/
