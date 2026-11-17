@@ -1,4 +1,4 @@
-# slurm-gpu-for-gitlab-ci
+# SLURM GPU for GitLab CI
 
 GitLab CI/CD on a SLURM cluster: build Docker images and run them on GPUs,
 as an ordinary user -- no root, no Docker daemon.
