@@ -4,6 +4,7 @@ GitLab CI/CD on a SLURM cluster: build Docker images and run them on GPUs,
 as an ordinary user -- no root, no Docker daemon.
 
 ```mermaid
+%%{init: {"look": "classic", "themeCSS": "* { filter: none !important; }"}}%%
 flowchart LR
     GL[(GitLab)]
 
@@ -50,6 +51,7 @@ One CI/CD job, step by step -- each step starts when the one before it is
 done:
 
 ```mermaid
+%%{init: {"look": "classic", "themeCSS": "* { filter: none !important; }"}}%%
 sequenceDiagram
     participant R as gitlab-runner<br/>(login node)
     participant J as CI/CD job<br/>(node 1)
