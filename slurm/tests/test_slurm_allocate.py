@@ -9,10 +9,14 @@ placed (BUILDKIT_NODE, SLURM_NODE, the site's partition/account) and that no
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+# The fakes' shebang: the bash on PATH. A nix build sandbox has no /bin/bash.
+SHEBANG = f"#!{shutil.which('bash') or '/bin/bash'}\n"
 
 ALLOCATE = Path(__file__).resolve().parents[1] / "bin" / "slurm-allocate"
 
@@ -29,12 +33,12 @@ def _run(tmp_path: Path, gpus=None, gres=f"{TYPED}:8(S:0)", used=f"{TYPED}:1(IDX
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "scontrol").write_text(
-        "#!/bin/bash\n"
-        f'echo "$*" >> {tmp_path}/scontrol.args\n'
+        SHEBANG
+        + f'echo "$*" >> {tmp_path}/scontrol.args\n'
         + ("exit 1\n" if scontrol_fails else f"echo '{NODE.format(gres=gres, used=used)}'\n"))
     (bin_dir / "salloc").write_text(
-        "#!/bin/bash\n"
-        f'printf "%s\\n" "$@" > {tmp_path}/salloc.args\n'
+        SHEBANG
+        + f'printf "%s\\n" "$@" > {tmp_path}/salloc.args\n'
         'echo "salloc: Granted job allocation 4242" >&2\n')
     for f in bin_dir.iterdir():
         f.chmod(0o755)
@@ -61,7 +65,7 @@ def _gres(args):
 def _shell(tmp_path: Path, emitted: str) -> str:
     """What the runner's shell sees after the eval: SLURM_GPUS and the log line."""
     bin_dir = tmp_path / "bin"
-    (bin_dir / "scancel").write_text("#!/bin/bash\n")
+    (bin_dir / "scancel").write_text(SHEBANG)
     (bin_dir / "scancel").chmod(0o755)
     script = emitted + '\necho "SLURM_GPUS=${SLURM_GPUS-unset}"\n'
     env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "SLURM_GPUS": "max"}
@@ -181,7 +185,7 @@ def test_the_environment_wins_over_the_config_file(tmp_path):
 def test_a_failing_salloc_shows_its_error(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "salloc").write_text("#!/bin/bash\necho 'salloc: error: Invalid partition name specified' >&2\nexit 1\n")
+    (bin_dir / "salloc").write_text(SHEBANG + "echo 'salloc: error: Invalid partition name specified' >&2\nexit 1\n")
     (bin_dir / "salloc").chmod(0o755)
     env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "SLURM_CI_CONFIG": str(tmp_path / "none"),
            "HOME": str(tmp_path), "SLURM_GPUS": "1"}
